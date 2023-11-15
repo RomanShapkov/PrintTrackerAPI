@@ -9,18 +9,54 @@ baseurl = "https://papi.printtrackerpro.com/v1/";
 
 [DataSource.Kind="PrintTrackerAPI", Publish="PrintTrackerAPI.Publish"]
 
-shared PrintTrackerAPI.Navigation = (entityId as text) as table =>
+shared PrintTrackerAPI.Navigation = Value.ReplaceType(PrintTrackerAPI.NavigationImpl, type6);
+
+type6 = type function (
+                     entityId as (type text meta [
+                        Documentation.FieldCaption = "entityId",
+                        Documentation.FieldDescription = "The ID of the entity that we want to pull supplies"
+                        ]),
+                    start as (type date meta [
+                        Documentation.FieldCaption = "start",
+                        Documentation.FieldDescription = "start period"
+                        ]),
+
+                    end as (type text meta [
+                        Documentation.FieldCaption = "end",
+                        Documentation.FieldDescription = "end period",
+                        Documentation.SampleValues = {"today", "2023-11-06", "2023-12-23"}
+                        ])
+                   )
+        as function meta [
+            Documentation.Name = "Navigation",
+            Documentation.LongDescription = "Navigation"
+    ];
+
+
+PrintTrackerAPI.NavigationImpl = (entityId as text, start as date, end as text) as table =>
     let
+        end = try if end = "today" then Date.From(DateTime.LocalNow()) else Date.From(end) otherwise Date.From(DateTime.LocalNow()), 
         NavTable = (tb as table) => Table.ToNavigationTable(tb, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf", "sort") ,
         table_header = {"Name", "Key", "Data", "ItemKind", "ItemName", "IsLeaf", "sort"},
         
+
+         r1 = #table(table_header, 
+            {
+                {"Get meters by device", "GetMetersByDevice", PrintTrackerAPI.GetMetersByDevice(entityId, start, end), "table", "table", "true", 1}
+
+             }),
+
         lv1 = #table(table_header, 
             {
-                {"Get an entity", "GetEntity", PrintTrackerAPI.GetEntity, "function", "function", "true", 1},
-                {"Get devices by entity", "GetDevicesByEntity", PrintTrackerAPI.GetDevicesByEntity, "function", "function", "true", 1},
+                {"Get an entity", "GetEntity", PrintTrackerAPI.GetEntity(entityId, true), "table", "table", "true", 1},
+                {"Get devices by entity", "GetDevicesByEntity", PrintTrackerAPI.GetDevicesByEntity(entityId, true), "table", "table", "true", 1},
                 {"Get meters by entity", "GeMetersByEntity", PrintTrackerAPI.GetMetersByEntity, "function", "function", "true", 1},
-                {"Get supplies by entity", "GetSuppliesByEntity", PrintTrackerAPI.GetSuppliesByEntity, "function", "function", "true", 1},
+                {"Get supplies by entity", "GetSuppliesByEntity", PrintTrackerAPI.GetSuppliesByEntity(entityId, start, end, true), "table", "table", "true", 1},
                 {"Get meters by device", "GetMetersByDevice", PrintTrackerAPI.GetMetersByDevice, "function", "function", "true", 1}
+                //{"Get meters by device", "GetMetersByDevice", NavTable(r1), "Table", "Table", "false", 1}
+
+                //{"Get meters by device", "GetMetersByDevice", PrintTrackerAPI.GetMetersByDevice(entityId, start, end), "table", "table", "true", 1}
+                
              })
    in
         NavTable(lv1);
@@ -73,8 +109,8 @@ type4= (nm as text , descr as text) => type function (
 
 PrintTrackerAPI.GetMetersByEntity = Value.ReplaceType(PrintTrackerAPI.GetMetersByEntityImpl, type3("Get meters by device", "Returns an array of meter reads for a single device"));
 type3 = (nm as text , descr as text) => type function (
-                     entityId as (type text meta [
-                        Documentation.FieldCaption = "entityId",
+                     RootEntityId as (type text meta [
+                        Documentation.FieldCaption = "RootEntityId",
                         Documentation.FieldDescription = "The ID of the entity that the device belongs to"
                         ]),
                     start as (type date meta [
@@ -115,6 +151,12 @@ type5 = (nm as text , descr as text) => type function (
                         Documentation.FieldDescription = "The start of the meter read date range"
                         ]),
 
+                    optional limit as (type number meta [
+                        Documentation.FieldCaption = "limit",
+                        Documentation.FieldDescription = "Default: 100 The maximum number of devices to return in a single request.",
+                        Documentation.SampleValues = {100}
+                        ]),
+                    
                     optional excludeDisabled as (type logical meta [
                         Documentation.FieldCaption = "excludeDisabled",
                         Documentation.FieldDescription = "Default: If true, only meters form managed devices will be returned.",
@@ -204,12 +246,13 @@ PrintTrackerAPI.GetDataFromEndpoint = (
 PrintTrackerAPI.GetData = (endpoint as text, params as record, keepError as logical) =>
     let
         h = [#"x-api-key" = apikey],
-        json = 
-            if 
-                keepError 
-                then Json.Document(Web.Contents(endpoint, [Headers = h, Query = params, ManualCredentials = true, ApiKeyName="x-api-key"]))
+        source = Web.Contents(endpoint, [Headers = h, Query = params, ManualCredentials = true, ApiKeyName="x-api-key"]),
+        responceCode = Value.Metadata(source),
+                 
+        json = if keepError 
+                then Json.Document(source)
                 else 
-                    try Json.Document(Web.Contents(endpoint, [Headers = h, Query = params, ManualCredentials = true, ApiKeyName="x-api-key"])) otherwise {}
+                    try Json.Document(source) otherwise {responceCode}
     in 
         json;
 
@@ -238,29 +281,42 @@ PrintTrackerAPI.GetDevicesByEntityImpl = (entityId as text, optional includeChil
         table;
 
 
-PrintTrackerAPI.GetMetersByEntityImpl = (entityId as text, start as date, end as date, optional excludeDisabled as logical) =>
+PrintTrackerAPI.GetMetersByEntityImpl = (RootEntityId as text, start as date, end as date, optional excludeDisabled as logical) =>
     let
-        url = "https://papi.printtrackerpro.com/v1/entity/" & entityId & "/meter",
-        dt1 = Date.ToText(start, "yyyy-MM-dd") &"T00:00:00.000Z",
-        dt2 = Date.ToText(end, "yyyy-MM-dd")   &"T23:59:59.999Z",
-        p =
-            let
-                p0 = [start = dt1, end = dt2],
-                p1 = add_rec(p0, "excludeDisabled", Text.From(excludeDisabled))
-            in 
-                p1,
+        getMeterByEntity = (endpoint as text) =>
+        let
+            url = "https://papi.printtrackerpro.com/v1/entity/" & endpoint & "/meter",
+            dt1 = Date.ToText(start, "yyyy-MM-dd") &"T00:00:00.000Z",
+            dt2 = Date.ToText(end, "yyyy-MM-dd")   &"T23:59:59.999Z",
+            p =
+                let
+                    p0 = [start = dt1, end = dt2],
+                    p1 = add_rec(p0, "excludeDisabled", Text.From(excludeDisabled))
+                in 
+                    p1,
+            json = PrintTrackerAPI.GetData(url, p, true)
+        in 
+            json,
         
-        json = PrintTrackerAPI.GetData(url, p, true),
-        table = toTable(json)
+        divices =
+            let
+                a = PrintTrackerAPI.GetEntity(RootEntityId, true),
+                b = Table.ExpandListColumn(a, "children"),
+                c = Table.ExpandRecordColumn(b, "children", {"id"}, {"children.id"}),
+                d = List.Distinct(c[children.id])
+            in 
+                d,
+        loop = List.Transform(divices, each getMeterByEntity(_) ),
+        table = toTable(List.Combine(loop))
     in
         table;
 
 
 PrintTrackerAPI.GetMetersByDeviceImpl = (entityId as text, start as date, end as date, optional limit as number, optional excludeDisabled as logical) =>
     let
-        getMeterByDevice = (deviceId as text) =>
+        getMeterByDevice = (endpoint as text) =>
             let
-                url = "https://papi.printtrackerpro.com/v1/entity/" & entityId & "/"& deviceId &"/meter",
+                url = "https://papi.printtrackerpro.com/v1/entity/" &endpoint,
                 dt1 = Date.ToText(start, "yyyy-MM-dd") &"T00:00:00.000Z",
                 dt2 = Date.ToText(end, "yyyy-MM-dd")   &"T23:59:59.999Z",
                 p =
@@ -269,11 +325,16 @@ PrintTrackerAPI.GetMetersByDeviceImpl = (entityId as text, start as date, end as
                         p1 = add_rec(p0, "excludeDisabled", Text.From(excludeDisabled))
                     in 
                         p1,
-                json = PrintTrackerAPI.GetDataFromEndpoint(url, p)
+                json = PrintTrackerAPI.GetData(url, p, true)
             in
                 json,
 
-        divices = PrintTrackerAPI.GetDevicesByEntity(entityId, true, null, excludeDisabled)[id],
+        divices =
+            let
+                a = Table.SelectColumns(PrintTrackerAPI.GetDevicesByEntity(entityId, true, null, excludeDisabled),{"id", "entityKey"}),
+                b = Table.AddColumn(a, "endpoint", each [entityKey] &"/device/"& [id] &"/meter")[endpoint]
+            in 
+                b,
         loop = List.Transform(divices, each getMeterByDevice(_) ),
         table = toTable(List.Combine(loop))
     in
